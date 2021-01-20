@@ -27,10 +27,14 @@ use crate::sys::weak::weak;
 use libc::RTP_ID as pid_t;
 
 #[cfg(not(target_os = "vxworks"))]
-use libc::{c_int, pid_t};
+use libc::{c_int, pid_t, dlsym, c_char};
 
 #[cfg(not(any(target_os = "vxworks", target_os = "l4re")))]
 use libc::{gid_t, uid_t};
+
+use crate::intrinsics::transmute;
+use crate::ffi::OsString;
+use sys::os::getenv;
 
 ////////////////////////////////////////////////////////////////////////////////
 // Command
@@ -61,6 +65,74 @@ impl Command {
 
         let (input, output) = sys::pipe::anon_pipe()?;
 
+	// If there is a RUST_EXEC_SHIM (could be "/usr/bin/env --")
+	// then we're probably going to directly execvp it via dlsym
+	// to avoid issues with threads and malloc post-fork and
+	// pre-exec. That will then re-execvp but this time sb2 will
+	// do magic. See also RUST_EXECVP_REAL
+
+	// We do this here and pass so do_exec() so any malloc's are
+	// pre-fork()
+
+	// At this point self.program is the real program. argv[0] is
+	// now a clone() of program.
+
+	let libc_h = unsafe { libc::dlopen("libc.so.6\0".as_ptr() as *const c_char,
+					   libc::RTLD_LAZY) };
+
+	match getenv(&OsString::from("SB2_RUST_EXECVP_SHIM"))? {
+	    Some(var) => { // handle "/usr/bin/env <arg> <arg>"
+		let var = var.into_string().expect("Valid string"); // so we can .split()
+		let words: Vec<&str> = var.as_str().split(" ").collect();
+		for w in words.iter().rev() {
+		    self.insert_program(w.to_string());
+		};
+		// At this point self.program is the SHIM. argv[0] is
+		// the SHIM and argv[>0] is the real program.
+	    },
+	    None => {} // Business as usual
+	};
+	match getenv(&OsString::from("SB2_RUST_USE_REAL_EXECVP"))? {
+	    Some(_var) => unsafe {
+		let real_execvp_p = dlsym(libc_h,
+		      "execvp\0".as_ptr() as *const c_char) as *const ();
+		self.execvp = Some(
+		    transmute::<*const (), ExecvpFn>(real_execvp_p) );
+	    },
+	    None => {}
+	};
+	match getenv(&OsString::from("SB2_RUST_USE_REAL_FN"))? {
+	    Some(_var) => unsafe {
+		let real_dup2_p = dlsym(libc_h,
+		      "dup2\0".as_ptr() as *const c_char) as *const ();
+		self.dup2 = Some(
+		    transmute::<*const (), Dup2Fn>(real_dup2_p) );
+		let real_close_p = dlsym(libc_h,
+		      "close\0".as_ptr() as *const c_char) as *const ();
+		self.close = Some(
+		    transmute::<*const (), CloseFn>(real_close_p) );
+		let real_chdir_p = dlsym(libc_h,
+		      "chdir\0".as_ptr() as *const c_char) as *const ();
+		self.chdir = Some(
+		    transmute::<*const (), ChdirFn>(real_chdir_p) );
+		let real_setuid_p = dlsym(libc_h,
+		      "setuid\0".as_ptr() as *const c_char) as *const ();
+		self.setuid = Some(
+		    transmute::<*const (), SetuidFn>(real_setuid_p) );
+		let real_setgid_p = dlsym(libc_h,
+		      "setgid\0".as_ptr() as *const c_char) as *const ();
+		self.setgid = Some(
+		    transmute::<*const (), SetgidFn>(real_setgid_p) );
+		let real_setgroups_p = dlsym(libc_h,
+		      "setgroups\0".as_ptr() as *const c_char) as *const ();
+		self.setgroups = Some(
+		    transmute::<*const (), SetgroupsFn>(real_setgroups_p) );
+	    },
+	    None => {}
+	};
+	// We close before calling but that's OK as this is just a lookup handle
+	unsafe { cvt(libc::dlclose(libc_h))? };
+
         // Whatever happens after the fork is almost for sure going to touch or
         // look at the environment in one way or another (PATH in `execvp` or
         // accessing the `environ` pointer ourselves). Make sure no other thread
@@ -76,7 +148,7 @@ impl Command {
         if pid == 0 {
             crate::panic::always_abort();
             mem::forget(env_lock);
-            drop(input);
+            self.unwrap_drop(input);
             let Err(err) = unsafe { self.do_exec(theirs, envp.as_ref()) };
             let errno = err.raw_os_error().unwrap_or(libc::EINVAL) as u32;
             let errno = errno.to_be_bytes();
@@ -243,7 +315,43 @@ impl Command {
             Err(e) => e,
         }
     }
-
+    fn unwrap_drop(&mut self, fh: sys::unix::pipe::AnonPipe) {
+        // drop() simply calls libc::close(fh.fd)
+        match self.close {
+            Some(real_close) => { (real_close)(fh.fd().raw()); },
+            None => { drop(fh); }
+        }
+    }
+    fn unwrap_dup2(&mut self, src: c_int, dst: c_int) -> c_int {
+        match self.dup2 {
+            Some(real_dup2) => { (real_dup2)(src, dst) },
+            None => { unsafe { libc::dup2(src, dst) } }
+        }
+    }
+    fn unwrap_chdir(&self, dir: *const c_char) -> c_int {
+        match self.chdir {
+            Some(real_chdir) => { (real_chdir)(dir) },
+            None => { unsafe { libc::chdir(dir) } }
+        }
+    }
+    fn unwrap_setuid(&self, uid: uid_t) -> c_int {
+        match self.setuid {
+            Some(real_setuid) => { (real_setuid)(uid) },
+            None => { unsafe { libc::setuid(uid) } }
+        }
+    }
+    fn unwrap_setgid(&self, gid: gid_t) -> c_int {
+        match self.setgid {
+            Some(real_setgid) => { (real_setgid)(gid) },
+            None => { unsafe { libc::setgid(gid) } }
+        }
+    }
+    fn unwrap_setgroups(&self, ngroups: libc::size_t, gid: *const gid_t) -> c_int {
+        match self.setgroups {
+            Some(real_setgroups) => { (real_setgroups)(ngroups, gid) },
+            None => { unsafe { libc::setgroups(ngroups, gid) } }
+        }
+    }
     // And at this point we've reached a special time in the life of the
     // child. The child must now be considered hamstrung and unable to
     // do anything other than syscalls really. Consider the following
@@ -282,13 +390,13 @@ impl Command {
         use crate::sys::{self, cvt_r};
 
         if let Some(fd) = stdio.stdin.fd() {
-            cvt_r(|| libc::dup2(fd, libc::STDIN_FILENO))?;
+            cvt_r(|| self.unwrap_dup2(fd, libc::STDIN_FILENO))?;
         }
         if let Some(fd) = stdio.stdout.fd() {
-            cvt_r(|| libc::dup2(fd, libc::STDOUT_FILENO))?;
+            cvt_r(|| self.unwrap_dup2(fd, libc::STDOUT_FILENO))?;
         }
         if let Some(fd) = stdio.stderr.fd() {
-            cvt_r(|| libc::dup2(fd, libc::STDERR_FILENO))?;
+            cvt_r(|| self.unwrap_dup2(fd, libc::STDERR_FILENO))?;
         }
 
         #[cfg(not(target_os = "l4re"))]
@@ -296,10 +404,10 @@ impl Command {
             if let Some(_g) = self.get_groups() {
                 //FIXME: Redox kernel does not support setgroups yet
                 #[cfg(not(target_os = "redox"))]
-                cvt(libc::setgroups(_g.len().try_into().unwrap(), _g.as_ptr()))?;
+                cvt(self.unwrap_setgroups(_g.len().try_into().unwrap(), _g.as_ptr()))?;
             }
             if let Some(u) = self.get_gid() {
-                cvt(libc::setgid(u as gid_t))?;
+                cvt(self.unwrap_setgid(u as gid_t))?;
             }
             if let Some(u) = self.get_uid() {
                 // When dropping privileges from root, the `setgroups` call
@@ -311,13 +419,13 @@ impl Command {
                 //FIXME: Redox kernel does not support setgroups yet
                 #[cfg(not(target_os = "redox"))]
                 if libc::getuid() == 0 && self.get_groups().is_none() {
-                    cvt(libc::setgroups(0, ptr::null()))?;
+                    cvt(self.unwrap_setgroups(0, ptr::null()))?;
                 }
-                cvt(libc::setuid(u as uid_t))?;
+                cvt(self.unwrap_setuid(u as uid_t))?;
             }
         }
         if let Some(ref cwd) = *self.get_cwd() {
-            cvt(libc::chdir(cwd.as_ptr()))?;
+            cvt(self.unwrap_chdir(cwd.as_ptr()))?;
         }
 
         if let Some(pgroup) = self.get_pgroup() {
@@ -378,9 +486,17 @@ impl Command {
             _reset = Some(Reset(*sys::os::environ()));
             *sys::os::environ() = envp.as_ptr();
         }
-
-        libc::execvp(self.get_program_cstr().as_ptr(), self.get_argv().as_ptr());
-        Err(io::Error::last_os_error())
+	match self.execvp {
+	    Some(real_execvp) => {
+		(real_execvp)(self.get_program_cstr().as_ptr(),
+			      self.get_argv().as_ptr())
+	    },
+	    None => {
+		libc::execvp(self.get_program_cstr().as_ptr(),
+			     self.get_argv().as_ptr())
+	    }
+	};
+	Err(io::Error::last_os_error())
     }
 
     #[cfg(not(any(
@@ -394,6 +510,7 @@ impl Command {
         _: &ChildPipes,
         _: Option<&CStringArray>,
     ) -> io::Result<Option<Process>> {
+	eprintln!("process_unix:270: in null posix_spawn");
         Ok(None)
     }
 
@@ -413,12 +530,15 @@ impl Command {
         use crate::mem::MaybeUninit;
         use crate::sys::{self, cvt_nz};
 
+        let skip_spawnvp: bool = getenv(&OsString::from("SB2_RUST_NO_SPAWNVP"))?.is_some();
+
         if self.get_gid().is_some()
             || self.get_uid().is_some()
             || (self.env_saw_path() && !self.program_is_path())
             || !self.get_closures().is_empty()
             || self.get_groups().is_some()
             || self.get_create_pidfd()
+            || skip_spawnvp
         {
             return Ok(None);
         }
